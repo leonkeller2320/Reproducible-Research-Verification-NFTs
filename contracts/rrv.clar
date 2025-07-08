@@ -9,6 +9,33 @@
 (define-constant err-invalid-token (err u103))
 (define-constant err-not-authorized (err u104))
 
+
+(define-constant err-collaboration-closed (err u106))
+(define-constant err-max-collaborators-reached (err u107))
+(define-constant err-invite-exists (err u108))
+(define-constant err-not-invited (err u109))
+(define-constant err-insufficient-permissions (err u110))
+
+(define-constant PERMISSION-EDIT-DATA u1)
+(define-constant PERMISSION-INVITE-OTHERS u2)
+(define-constant PERMISSION-MANAGE-SETTINGS u4)
+
+(define-map token-uris { token-id: uint } { uri: (string-ascii 256) })
+(define-map research-data 
+    { token-id: uint }
+    {
+        dataset-hash: (string-ascii 64),
+        methodology: (string-ascii 256),
+        results-hash: (string-ascii 64),
+        timestamp: uint,
+        researcher: principal,
+        verified: bool
+    }
+)
+
+(define-map token-verifiers { token-id: uint, verifier: principal } { verified: bool })
+
+
 (define-data-var token-id-nonce uint u0)
 (define-data-var base-uri (string-ascii 256) "ipfs://")
 
@@ -41,31 +68,6 @@
         collaboration-open: bool
     }
 )
-
-(define-constant err-collaboration-closed (err u106))
-(define-constant err-max-collaborators-reached (err u107))
-(define-constant err-invite-exists (err u108))
-(define-constant err-not-invited (err u109))
-(define-constant err-insufficient-permissions (err u110))
-
-(define-constant PERMISSION-EDIT-DATA u1)
-(define-constant PERMISSION-INVITE-OTHERS u2)
-(define-constant PERMISSION-MANAGE-SETTINGS u4)
-
-(define-map token-uris { token-id: uint } { uri: (string-ascii 256) })
-(define-map research-data 
-    { token-id: uint }
-    {
-        dataset-hash: (string-ascii 64),
-        methodology: (string-ascii 256),
-        results-hash: (string-ascii 64),
-        timestamp: uint,
-        researcher: principal,
-        verified: bool
-    }
-)
-
-(define-map token-verifiers { token-id: uint, verifier: principal } { verified: bool })
 
 (define-read-only (get-last-token-id)
     (var-get token-id-nonce)
@@ -396,5 +398,382 @@
     (match (map-get? collaborators { token-id: token-id, collaborator: user })
         collab (> (bit-and (get permissions collab) permission) u0)
         false
+    )
+)
+
+(define-map researcher-reputation
+    { researcher: principal }
+    {
+        total-score: uint,
+        peer-review-score: uint,
+        verification-score: uint,
+        collaboration-score: uint,
+        publication-count: uint,
+        last-updated: uint,
+        reputation-tier: (string-ascii 16)
+    }
+)
+
+(define-map score-history
+    { researcher: principal, period: uint }
+    {
+        score: uint,
+        timestamp: uint,
+        score-type: (string-ascii 16)
+    }
+)
+
+(define-map reputation-metrics
+    { researcher: principal }
+    {
+        total-peer-reviews: uint,
+        avg-peer-rating: uint,
+        verification-count: uint,
+        collaboration-success-rate: uint,
+        research-impact-factor: uint,
+        last-activity: uint
+    }
+)
+
+(define-map citation-networks
+    { citing-token: uint, cited-token: uint }
+    {
+        citation-type: (string-ascii 32),
+        timestamp: uint,
+        weight: uint
+    }
+)
+
+(define-map research-quality-indicators
+    { token-id: uint }
+    {
+        reproducibility-score: uint,
+        methodology-score: uint,
+        data-quality-score: uint,
+        innovation-score: uint,
+        peer-validation-count: uint
+    }
+)
+
+(define-constant TIER-BRONZE "bronze")
+(define-constant TIER-SILVER "silver")
+(define-constant TIER-GOLD "gold")
+(define-constant TIER-PLATINUM "platinum")
+(define-constant TIER-DIAMOND "diamond")
+
+(define-constant BRONZE-THRESHOLD u100)
+(define-constant SILVER-THRESHOLD u300)
+(define-constant GOLD-THRESHOLD u600)
+(define-constant PLATINUM-THRESHOLD u1000)
+(define-constant DIAMOND-THRESHOLD u1500)
+
+(define-constant PEER-REVIEW-WEIGHT u30)
+(define-constant VERIFICATION-WEIGHT u25)
+(define-constant COLLABORATION-WEIGHT u20)
+(define-constant CITATION-WEIGHT u15)
+(define-constant QUALITY-WEIGHT u10)
+
+(define-constant err-reputation-not-found (err u111))
+(define-constant err-invalid-score-type (err u112))
+(define-constant err-citation-exists (err u113))
+(define-constant err-self-citation (err u114))
+
+(define-private (calculate-tier (score uint))
+    (if (>= score DIAMOND-THRESHOLD)
+        TIER-DIAMOND
+        (if (>= score PLATINUM-THRESHOLD)
+            TIER-PLATINUM
+            (if (>= score GOLD-THRESHOLD)
+                TIER-GOLD
+                (if (>= score SILVER-THRESHOLD)
+                    TIER-SILVER
+                    TIER-BRONZE
+                )
+            )
+        )
+    )
+)
+
+(define-private (calculate-peer-review-score (researcher principal))
+    (let (
+        (metrics (default-to 
+            { total-peer-reviews: u0, avg-peer-rating: u0, verification-count: u0, collaboration-success-rate: u0, research-impact-factor: u0, last-activity: u0 }
+            (map-get? reputation-metrics { researcher: researcher })))
+        (review-count (get total-peer-reviews metrics))
+        (avg-rating (get avg-peer-rating metrics))
+        )
+        (if (> review-count u0)
+            (/ (* avg-rating review-count PEER-REVIEW-WEIGHT) u100)
+            u0
+        )
+    )
+)
+
+(define-private (calculate-verification-score (researcher principal))
+    (let (
+        (metrics (default-to 
+            { total-peer-reviews: u0, avg-peer-rating: u0, verification-count: u0, collaboration-success-rate: u0, research-impact-factor: u0, last-activity: u0 }
+            (map-get? reputation-metrics { researcher: researcher })))
+        (verification-count (get verification-count metrics))
+        )
+        (* verification-count VERIFICATION-WEIGHT)
+    )
+)
+
+(define-private (calculate-collaboration-score (researcher principal))
+    (let (
+        (metrics (default-to 
+            { total-peer-reviews: u0, avg-peer-rating: u0, verification-count: u0, collaboration-success-rate: u0, research-impact-factor: u0, last-activity: u0 }
+            (map-get? reputation-metrics { researcher: researcher })))
+        (success-rate (get collaboration-success-rate metrics))
+        )
+        (/ (* success-rate COLLABORATION-WEIGHT) u100)
+    )
+)
+
+(define-private (calculate-citation-score (researcher principal))
+    (let (
+        (metrics (default-to 
+            { total-peer-reviews: u0, avg-peer-rating: u0, verification-count: u0, collaboration-success-rate: u0, research-impact-factor: u0, last-activity: u0 }
+            (map-get? reputation-metrics { researcher: researcher })))
+        (impact-factor (get research-impact-factor metrics))
+        )
+        (/ (* impact-factor CITATION-WEIGHT) u100)
+    )
+)
+
+(define-private (update-reputation-score (researcher principal))
+    (let (
+        (peer-score (calculate-peer-review-score researcher))
+        (verification-score (calculate-verification-score researcher))
+        (collaboration-score (calculate-collaboration-score researcher))
+        (citation-score (calculate-citation-score researcher))
+        (total-score (+ peer-score (+ verification-score (+ collaboration-score citation-score))))
+        (tier (calculate-tier total-score))
+        (current-rep (default-to 
+            { total-score: u0, peer-review-score: u0, verification-score: u0, collaboration-score: u0, publication-count: u0, last-updated: u0, reputation-tier: TIER-BRONZE }
+            (map-get? researcher-reputation { researcher: researcher })))
+        )
+        (map-set researcher-reputation
+            { researcher: researcher }
+            {
+                total-score: total-score,
+                peer-review-score: peer-score,
+                verification-score: verification-score,
+                collaboration-score: collaboration-score,
+                publication-count: (get publication-count current-rep),
+                last-updated: stacks-block-height,
+                reputation-tier: tier
+            }
+        )
+        (map-set score-history
+            { researcher: researcher, period: stacks-block-height }
+            {
+                score: total-score,
+                timestamp: stacks-block-height,
+                score-type: "total"
+            }
+        )
+        (ok total-score)
+    )
+)
+
+(define-public (record-research-citation (citing-token uint) (cited-token uint) (citation-type (string-ascii 32)) (weight uint))
+    (let (
+        (citing-owner (unwrap! (nft-get-owner? rrv-nft citing-token) err-invalid-token))
+        (cited-owner (unwrap! (nft-get-owner? rrv-nft cited-token) err-invalid-token))
+        )
+        (asserts! (is-eq tx-sender citing-owner) err-not-token-owner)
+        (asserts! (not (is-eq citing-token cited-token)) err-self-citation)
+        (asserts! (is-none (map-get? citation-networks { citing-token: citing-token, cited-token: cited-token })) err-citation-exists)
+        (map-set citation-networks
+            { citing-token: citing-token, cited-token: cited-token }
+            {
+                citation-type: citation-type,
+                timestamp: stacks-block-height,
+                weight: weight
+            }
+        )
+        (unwrap-panic (update-researcher-metrics cited-owner))
+        (unwrap-panic (update-reputation-score cited-owner))
+        (ok true)
+    )
+)
+
+(define-public (rate-research-quality (token-id uint) (reproducibility uint) (methodology uint) (data-quality uint) (innovation uint))
+    (let (
+        (reviewer-status (default-to { approved: false } 
+            (map-get? approved-reviewers { reviewer: tx-sender })))
+        )
+        (asserts! (get approved reviewer-status) err-not-authorized)
+        (asserts! (and (<= reproducibility u100) (<= methodology u100) (<= data-quality u100) (<= innovation u100)) (err u115))
+        (map-set research-quality-indicators
+            { token-id: token-id }
+            {
+                reproducibility-score: reproducibility,
+                methodology-score: methodology,
+                data-quality-score: data-quality,
+                innovation-score: innovation,
+                peer-validation-count: u1
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-researcher-metrics (researcher principal))
+    (let (
+        (current-metrics (default-to 
+            { total-peer-reviews: u0, avg-peer-rating: u0, verification-count: u0, collaboration-success-rate: u0, research-impact-factor: u0, last-activity: u0 }
+            (map-get? reputation-metrics { researcher: researcher })))
+        (new-peer-reviews (+ (get total-peer-reviews current-metrics) u1))
+        (new-verification-count (+ (get verification-count current-metrics) u1))
+        (new-impact-factor (+ (get research-impact-factor current-metrics) u10))
+        )
+        (map-set reputation-metrics
+            { researcher: researcher }
+            {
+                total-peer-reviews: new-peer-reviews,
+                avg-peer-rating: (get avg-peer-rating current-metrics),
+                verification-count: new-verification-count,
+                collaboration-success-rate: (get collaboration-success-rate current-metrics),
+                research-impact-factor: new-impact-factor,
+                last-activity: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (boost-reputation (researcher principal) (boost-amount uint) (boost-type (string-ascii 16)))
+    (let (
+        (current-rep (default-to 
+            { total-score: u0, peer-review-score: u0, verification-score: u0, collaboration-score: u0, publication-count: u0, last-updated: u0, reputation-tier: TIER-BRONZE }
+            (map-get? researcher-reputation { researcher: researcher })))
+        (new-total (+ (get total-score current-rep) boost-amount))
+        (new-tier (calculate-tier new-total))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set researcher-reputation
+            { researcher: researcher }
+            (merge current-rep {
+                total-score: new-total,
+                last-updated: stacks-block-height,
+                reputation-tier: new-tier
+            })
+        )
+        (map-set score-history
+            { researcher: researcher, period: stacks-block-height }
+            {
+                score: boost-amount,
+                timestamp: stacks-block-height,
+                score-type: boost-type
+            }
+        )
+        (ok new-total)
+    )
+)
+
+(define-public (penalize-reputation (researcher principal) (penalty-amount uint) (penalty-reason (string-ascii 16)))
+    (let (
+        (current-rep (default-to 
+            { total-score: u0, peer-review-score: u0, verification-score: u0, collaboration-score: u0, publication-count: u0, last-updated: u0, reputation-tier: TIER-BRONZE }
+            (map-get? researcher-reputation { researcher: researcher })))
+        (current-score (get total-score current-rep))
+        (new-total (if (>= current-score penalty-amount) (- current-score penalty-amount) u0))
+        (new-tier (calculate-tier new-total))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set researcher-reputation
+            { researcher: researcher }
+            (merge current-rep {
+                total-score: new-total,
+                last-updated: stacks-block-height,
+                reputation-tier: new-tier
+            })
+        )
+        (map-set score-history
+            { researcher: researcher, period: stacks-block-height }
+            {
+                score: penalty-amount,
+                timestamp: stacks-block-height,
+                score-type: penalty-reason
+            }
+        )
+        (ok new-total)
+    )
+)
+
+(define-read-only (get-researcher-reputation (researcher principal))
+    (match (map-get? researcher-reputation { researcher: researcher })
+        reputation (ok reputation)
+        (err err-reputation-not-found)
+    )
+)
+
+(define-read-only (get-reputation-metrics (researcher principal))
+    (match (map-get? reputation-metrics { researcher: researcher })
+        metrics (ok metrics)
+        (err err-reputation-not-found)
+    )
+)
+
+(define-read-only (get-citation-info (citing-token uint) (cited-token uint))
+    (match (map-get? citation-networks { citing-token: citing-token, cited-token: cited-token })
+        citation (ok citation)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (get-research-quality (token-id uint))
+    (match (map-get? research-quality-indicators { token-id: token-id })
+        quality (ok quality)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (get-score-history (researcher principal) (period uint))
+    (match (map-get? score-history { researcher: researcher, period: period })
+        history (ok history)
+        (err err-reputation-not-found)
+    )
+)
+
+(define-read-only (calculate-reputation-rank (researcher principal))
+    (let (
+        (reputation (default-to 
+            { total-score: u0, peer-review-score: u0, verification-score: u0, collaboration-score: u0, publication-count: u0, last-updated: u0, reputation-tier: TIER-BRONZE }
+            (map-get? researcher-reputation { researcher: researcher })))
+        (score (get total-score reputation))
+        )
+        (if (>= score DIAMOND-THRESHOLD)
+            (ok u5)
+            (if (>= score PLATINUM-THRESHOLD)
+                (ok u4)
+                (if (>= score GOLD-THRESHOLD)
+                    (ok u3)
+                    (if (>= score SILVER-THRESHOLD)
+                        (ok u2)
+                        (ok u1)
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-reputation-tier-requirements (tier (string-ascii 16)))
+    (if (is-eq tier TIER-DIAMOND)
+        (ok { threshold: DIAMOND-THRESHOLD, benefits: "maximum-privileges" })
+        (if (is-eq tier TIER-PLATINUM)
+            (ok { threshold: PLATINUM-THRESHOLD, benefits: "advanced-privileges" })
+            (if (is-eq tier TIER-GOLD)
+                (ok { threshold: GOLD-THRESHOLD, benefits: "enhanced-privileges" })
+                (if (is-eq tier TIER-SILVER)
+                    (ok { threshold: SILVER-THRESHOLD, benefits: "standard-privileges" })
+                    (ok { threshold: BRONZE-THRESHOLD, benefits: "basic-privileges" })
+                )
+            )
+        )
     )
 )
