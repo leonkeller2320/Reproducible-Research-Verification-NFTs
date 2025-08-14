@@ -777,3 +777,413 @@
         )
     )
 )
+
+;; Research Data Versioning & Evolution Tracking System
+(define-map research-versions
+    { token-id: uint }
+    {
+        version-number: uint,
+        parent-token: (optional uint),
+        branch-name: (string-ascii 32),
+        is-merged: bool,
+        merged-into: (optional uint),
+        created-at: uint,
+        version-type: (string-ascii 16)
+    }
+)
+
+(define-map version-lineage
+    { parent-token: uint, child-token: uint }
+    {
+        relationship-type: (string-ascii 16),
+        created-at: uint,
+        merge-weight: uint,
+        evolution-notes: (string-ascii 256)
+    }
+)
+
+(define-map evolution-changelog
+    { token-id: uint, change-id: uint }
+    {
+        change-type: (string-ascii 32),
+        field-modified: (string-ascii 32),
+        previous-hash: (string-ascii 64),
+        new-hash: (string-ascii 64),
+        change-description: (string-ascii 256),
+        timestamp: uint
+    }
+)
+
+(define-map version-metadata
+    { token-id: uint }
+    {
+        evolution-stage: (string-ascii 24),
+        confidence-level: uint,
+        breaking-changes: bool,
+        backwards-compatible: bool,
+        peer-validated: bool,
+        integration-tested: bool
+    }
+)
+
+(define-map research-forks
+    { original-token: uint, fork-token: uint }
+    {
+        fork-reason: (string-ascii 64),
+        divergence-point: (string-ascii 64),
+        fork-creator: principal,
+        collaboration-open: bool,
+        merge-eligible: bool
+    }
+)
+
+;; Version tracking constants
+(define-constant VERSION-INITIAL "initial")
+(define-constant VERSION-REVISION "revision")
+(define-constant VERSION-FORK "fork")
+(define-constant VERSION-MERGE "merge")
+(define-constant VERSION-BRANCH "branch")
+
+(define-constant STAGE-DRAFT "draft")
+(define-constant STAGE-REVIEW "under-review")
+(define-constant STAGE-VALIDATED "validated")
+(define-constant STAGE-PUBLISHED "published")
+(define-constant STAGE-DEPRECATED "deprecated")
+
+(define-constant err-invalid-parent (err u116))
+(define-constant err-version-exists (err u117))
+(define-constant err-cannot-merge (err u118))
+(define-constant err-invalid-version-type (err u119))
+(define-constant err-fork-not-allowed (err u120))
+
+(define-data-var global-change-counter uint u0)
+
+;; Create a new version of existing research
+(define-public (create-research-version 
+    (parent-token uint) 
+    (new-dataset-hash (string-ascii 64)) 
+    (new-methodology (string-ascii 256)) 
+    (new-results-hash (string-ascii 64))
+    (branch-name (string-ascii 32))
+    (change-description (string-ascii 256)))
+    (let (
+        (parent-owner (unwrap! (nft-get-owner? rrv-nft parent-token) err-invalid-parent))
+        (new-token-id (+ (var-get token-id-nonce) u1))
+        (parent-version (default-to 
+            { version-number: u1, parent-token: none, branch-name: "main", is-merged: false, merged-into: none, created-at: u0, version-type: VERSION-INITIAL }
+            (map-get? research-versions { token-id: parent-token })))
+        (new-version-number (+ (get version-number parent-version) u1))
+        (change-id (var-get global-change-counter))
+        )
+        ;; Only parent owner or collaborators can create versions
+        (asserts! (or (is-eq tx-sender parent-owner) 
+                     (is-collaborator parent-token tx-sender)) err-not-authorized)
+        
+        ;; Mint new NFT for the version
+        (try! (nft-mint? rrv-nft new-token-id tx-sender))
+        
+        ;; Set research data for new version
+        (map-set research-data
+            { token-id: new-token-id }
+            {
+                dataset-hash: new-dataset-hash,
+                methodology: new-methodology,
+                results-hash: new-results-hash,
+                timestamp: stacks-block-height,
+                researcher: tx-sender,
+                verified: false
+            }
+        )
+        
+        ;; Set version information
+        (map-set research-versions
+            { token-id: new-token-id }
+            {
+                version-number: new-version-number,
+                parent-token: (some parent-token),
+                branch-name: branch-name,
+                is-merged: false,
+                merged-into: none,
+                created-at: stacks-block-height,
+                version-type: VERSION-REVISION
+            }
+        )
+        
+        ;; Record lineage relationship
+        (map-set version-lineage
+            { parent-token: parent-token, child-token: new-token-id }
+            {
+                relationship-type: "evolution",
+                created-at: stacks-block-height,
+                merge-weight: u100,
+                evolution-notes: change-description
+            }
+        )
+        
+        ;; Log the evolution change
+        (map-set evolution-changelog
+            { token-id: new-token-id, change-id: change-id }
+            {
+                change-type: "version-creation",
+                field-modified: "all-fields",
+                previous-hash: (get results-hash (unwrap-panic (map-get? research-data { token-id: parent-token }))),
+                new-hash: new-results-hash,
+                change-description: change-description,
+                timestamp: stacks-block-height
+            }
+        )
+        
+        ;; Initialize version metadata
+        (map-set version-metadata
+            { token-id: new-token-id }
+            {
+                evolution-stage: STAGE-DRAFT,
+                confidence-level: u60,
+                breaking-changes: false,
+                backwards-compatible: true,
+                peer-validated: false,
+                integration-tested: false
+            }
+        )
+        
+        (var-set token-id-nonce new-token-id)
+        (var-set global-change-counter (+ change-id u1))
+        (ok new-token-id)
+    )
+)
+
+;; Fork research to create independent research path
+(define-public (fork-research 
+    (original-token uint) 
+    (fork-reason (string-ascii 64))
+    (divergence-point (string-ascii 64))
+    (new-branch-name (string-ascii 32)))
+    (let (
+        (original-data (unwrap! (map-get? research-data { token-id: original-token }) err-invalid-token))
+        (new-token-id (+ (var-get token-id-nonce) u1))
+        )
+        ;; Anyone can fork public research
+        (asserts! (is-some (nft-get-owner? rrv-nft original-token)) err-invalid-token)
+        
+        ;; Mint new NFT for the fork
+        (try! (nft-mint? rrv-nft new-token-id tx-sender))
+        
+        ;; Copy original research data
+        (map-set research-data
+            { token-id: new-token-id }
+            (merge original-data {
+                timestamp: stacks-block-height,
+                researcher: tx-sender,
+                verified: false
+            })
+        )
+        
+        ;; Set version as fork
+        (map-set research-versions
+            { token-id: new-token-id }
+            {
+                version-number: u1,
+                parent-token: (some original-token),
+                branch-name: new-branch-name,
+                is-merged: false,
+                merged-into: none,
+                created-at: stacks-block-height,
+                version-type: VERSION-FORK
+            }
+        )
+        
+        ;; Record fork relationship
+        (map-set research-forks
+            { original-token: original-token, fork-token: new-token-id }
+            {
+                fork-reason: fork-reason,
+                divergence-point: divergence-point,
+                fork-creator: tx-sender,
+                collaboration-open: true,
+                merge-eligible: false
+            }
+        )
+        
+        ;; Initialize fork metadata
+        (map-set version-metadata
+            { token-id: new-token-id }
+            {
+                evolution-stage: STAGE-DRAFT,
+                confidence-level: u50,
+                breaking-changes: true,
+                backwards-compatible: false,
+                peer-validated: false,
+                integration-tested: false
+            }
+        )
+        
+        (var-set token-id-nonce new-token-id)
+        (ok new-token-id)
+    )
+)
+
+;; Merge research versions back together
+(define-public (merge-research-versions 
+    (source-token uint) 
+    (target-token uint) 
+    (merge-strategy (string-ascii 32))
+    (conflict-resolution (string-ascii 256)))
+    (let (
+        (source-owner (unwrap! (nft-get-owner? rrv-nft source-token) err-invalid-token))
+        (target-owner (unwrap! (nft-get-owner? rrv-nft target-token) err-invalid-token))
+        (source-version (unwrap! (map-get? research-versions { token-id: source-token }) err-invalid-token))
+        (target-version (unwrap! (map-get? research-versions { token-id: target-token }) err-invalid-token))
+        (change-id (var-get global-change-counter))
+        )
+        ;; Only owners can initiate merges
+        (asserts! (or (is-eq tx-sender source-owner) (is-eq tx-sender target-owner)) err-not-authorized)
+        
+        ;; Cannot merge if already merged
+        (asserts! (not (get is-merged source-version)) err-cannot-merge)
+        
+        ;; Mark source as merged
+        (map-set research-versions
+            { token-id: source-token }
+            (merge source-version {
+                is-merged: true,
+                merged-into: (some target-token)
+            })
+        )
+        
+        ;; Log merge operation
+        (map-set evolution-changelog
+            { token-id: target-token, change-id: change-id }
+            {
+                change-type: "merge-operation",
+                field-modified: "merged-content",
+                previous-hash: (get results-hash (unwrap-panic (map-get? research-data { token-id: target-token }))),
+                new-hash: (get results-hash (unwrap-panic (map-get? research-data { token-id: source-token }))),
+                change-description: conflict-resolution,
+                timestamp: stacks-block-height
+            }
+        )
+        
+        ;; Update target version metadata
+        (map-set version-metadata
+            { token-id: target-token }
+            {
+                evolution-stage: STAGE-REVIEW,
+                confidence-level: u80,
+                breaking-changes: false,
+                backwards-compatible: true,
+                peer-validated: false,
+                integration-tested: true
+            }
+        )
+        
+        (var-set global-change-counter (+ change-id u1))
+        (ok true)
+    )
+)
+
+;; Update version stage and metadata
+(define-public (update-version-stage 
+    (token-id uint) 
+    (new-stage (string-ascii 24)) 
+    (confidence-level uint)
+    (breaking-changes bool))
+    (let (
+        (owner (unwrap! (nft-get-owner? rrv-nft token-id) err-invalid-token))
+        (current-metadata (default-to 
+            { evolution-stage: STAGE-DRAFT, confidence-level: u50, breaking-changes: false, backwards-compatible: true, peer-validated: false, integration-tested: false }
+            (map-get? version-metadata { token-id: token-id })))
+        )
+        (asserts! (is-eq tx-sender owner) err-not-token-owner)
+        (asserts! (<= confidence-level u100) (err u121))
+        
+        (map-set version-metadata
+            { token-id: token-id }
+            (merge current-metadata {
+                evolution-stage: new-stage,
+                confidence-level: confidence-level,
+                breaking-changes: breaking-changes,
+                backwards-compatible: (not breaking-changes)
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Enable merge eligibility for forks
+(define-public (enable-fork-merge (original-token uint) (fork-token uint))
+    (let (
+        (original-owner (unwrap! (nft-get-owner? rrv-nft original-token) err-invalid-token))
+        (fork-info (unwrap! (map-get? research-forks { original-token: original-token, fork-token: fork-token }) err-invalid-token))
+        )
+        (asserts! (is-eq tx-sender original-owner) err-not-token-owner)
+        
+        (map-set research-forks
+            { original-token: original-token, fork-token: fork-token }
+            (merge fork-info { merge-eligible: true })
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions for version queries
+(define-read-only (get-version-info (token-id uint))
+    (match (map-get? research-versions { token-id: token-id })
+        version (ok version)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (get-version-lineage (parent-token uint) (child-token uint))
+    (match (map-get? version-lineage { parent-token: parent-token, child-token: child-token })
+        lineage (ok lineage)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (get-evolution-changelog (token-id uint) (change-id uint))
+    (match (map-get? evolution-changelog { token-id: token-id, change-id: change-id })
+        change (ok change)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (get-version-metadata (token-id uint))
+    (match (map-get? version-metadata { token-id: token-id })
+        metadata (ok metadata)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (get-fork-info (original-token uint) (fork-token uint))
+    (match (map-get? research-forks { original-token: original-token, fork-token: fork-token })
+        fork-info (ok fork-info)
+        (err err-invalid-token)
+    )
+)
+
+(define-read-only (is-version-ancestor (ancestor-token uint) (descendant-token uint))
+    (let (
+        (descendant-version (map-get? research-versions { token-id: descendant-token }))
+        )
+        (match descendant-version
+            version (match (get parent-token version)
+                parent (is-eq parent ancestor-token)
+                false)
+            false
+        )
+    )
+)
+
+(define-read-only (get-version-tree-depth (token-id uint))
+    (let (
+        (version-info (map-get? research-versions { token-id: token-id }))
+        )
+        (match version-info
+            version (match (get parent-token version)
+                parent u1
+                u0)
+            u0
+        )
+    )
+)
+
